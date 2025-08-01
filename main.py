@@ -418,6 +418,19 @@ if __name__ == "__main__":
          f"✅ Signal threshold: {SIGNAL_CONF_THRESHOLD*100:.0f}%\n"
          f"🚀 Ready to find trading opportunities!")
     
-    # Start Flask web server
+    import threading
+
+def run_bot():
+    while True:
+        try:
+            evaluate_all_symbols()  # your core signal-checking function
+        except Exception as e:
+            print("Error during signal evaluation:", str(e))
+        time.sleep(60)  # delay between signal scans
+
+if __name__ == "__main__":
+    print("[INIT] Starting trading bot thread...")
+    threading.Thread(target=run_bot, daemon=True).start()
+
     print("[INIT] Starting web server...")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
