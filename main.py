@@ -280,10 +280,23 @@ def scan():
                     if df.empty or len(df) < 200:
                         continue
 
+                    # --- Signal evaluation logic ---
+                    try:
+                        signal, reason = evaluate_symbol(df)
+                        if signal:
+                            message = f"📈 *Signal Found!* {pair} | {tf} TF\n🧠 Reason: {reason}"
+                            send_telegram_message(message)
+                    except Exception as e:
+                        print(f"[ERROR] Signal eval failed for {pair} ({tf}): {e}")
+
+                    # --- Optional: custom metrics like ATR/close etc ---
                     idx = len(df) - 1
                     atr_series = atr(df)
                     atr_val = atr_series.iloc[-1] if len(atr_series) > 0 else 0
                     close = df["close"].iloc[-1]
+
+        except Exception as e:
+            print(f"[SCAN ERROR] {e}")
 
                     # Global guards
                     if skip_event_window():
