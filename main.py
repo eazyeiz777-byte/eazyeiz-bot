@@ -299,7 +299,11 @@ def scan():
             print(f"[SCAN ERROR] {e}")
 
                     # Global guards
-                    if skip_event_window():
+                    def evaluate_symbol(df):
+    if skip_event_window():
+        return False, "Skipping due to major event window"
+    
+    # ... your signal logic below ...
                         continue
                     news_flag = check_news(pair.split("USDT")[0])
                     session_ok = in_session() and not risky_time()
