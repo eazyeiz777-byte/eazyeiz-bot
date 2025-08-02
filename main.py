@@ -1,4 +1,4 @@
-# ============================================================
+from strategy import evaluate_symbol# ============================================================
 #  SMC Scalper Bot – FINAL PRODUCTION VERSION
 #  Ready for deployment on Render, Railway, Fly.io, or any cloud platform
 #  All API issues fixed, tested and verified working
