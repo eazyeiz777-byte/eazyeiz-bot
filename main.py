@@ -276,8 +276,7 @@ def scan():
             for pair in PAIRS:
                 for tf in TIMEFRAMES:
                     df = fetch_ohlcv(pair, tf)
-                    print(f"Evaluating {symbol} on {tf}")
-                    if df.empty or len(df) < 200:
+                if df.empty or len(df) < 200:
                         continue
 
                     idx = len(df) - 1
