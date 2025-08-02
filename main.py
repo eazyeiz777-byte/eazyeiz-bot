@@ -5,11 +5,11 @@
 # ============================================================
 
 # ---------- 0. Imports ----------
-from strategy import evaluate_symbol
 import os, sys, csv, time, threading, requests, numpy as np, pandas as pd
 from datetime import datetime, timedelta, time as dt_time
 from dotenv import load_dotenv
 from flask import Flask, jsonify
+from strategy import evaluate_symbol
 
 load_dotenv()
 
