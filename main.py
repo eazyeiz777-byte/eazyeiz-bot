@@ -7,7 +7,7 @@ import requests
 import numpy as np
 import pandas as pd
 import logging
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from flask import Flask, jsonify
 from threading import Thread
@@ -63,19 +63,30 @@ def fetch_top_pairs_by_volume():
             "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=200&page=1&sparkline=false",
             timeout=10
         )
+        response.raise_for_status()  # Raises an HTTPError for bad responses (4XX, 5XX)
         data = response.json()
         if isinstance(data, list):
-            return [f"{coin['symbol'].upper()}-USDT" for coin in data[:TOP_N_PAIRS]]
+            pairs = [f"{coin['symbol'].upper()}-USDT" for coin in data[:TOP_N_PAIRS]]
+            logger.info(f"Fetched {len(pairs)} trading pairs from CoinGecko")
+            return pairs
+        else:
+            logger.error("Unexpected data format from CoinGecko API")
+            return []
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error fetching top pairs by volume from CoinGecko: {e}")
         return []
     except Exception as e:
-        logger.error(f"Error fetching top pairs by volume from CoinGecko: {e}")
+        logger.error(f"Unexpected error fetching top pairs by volume from CoinGecko: {e}")
         return []
 
 def update_top_pairs():
     global top_pairs
     while True:
         top_pairs = fetch_top_pairs_by_volume()
-        logger.info(f"Updated top {len(top_pairs)} pairs by volume")
+        if not top_pairs:
+            logger.error("Failed to update top pairs list.")
+        else:
+            logger.info(f"Updated top {len(top_pairs)} pairs by volume")
         time.sleep(24 * 60 * 60)  # Refresh every 24 hours
 
 # OHLCV fetch from KuCoin
@@ -133,7 +144,6 @@ def scan_pairs_parallel(pairs, timeframes, max_workers=10, rate_limit_per_second
     return results
 
 # Economic-calendar filter
-from datetime import timezone
 EVENT_CACHE = {"last": None, "events": []}
 
 def high_impact_events():
@@ -449,3 +459,4 @@ if __name__ == "__main__":
     threading.Thread(target=scan, daemon=True).start()
     threading.Thread(target=keep_alive, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+    
