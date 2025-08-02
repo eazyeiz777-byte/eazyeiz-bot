@@ -1,10 +1,11 @@
-from strategy import evaluate_symbol# ============================================================
+# ============================================================
 #  SMC Scalper Bot – FINAL PRODUCTION VERSION
 #  Ready for deployment on Render, Railway, Fly.io, or any cloud platform
 #  All API issues fixed, tested and verified working
 # ============================================================
 
 # ---------- 0. Imports ----------
+from strategy import evaluate_symbol
 import os, sys, csv, time, threading, requests, numpy as np, pandas as pd
 from datetime import datetime, timedelta, time as dt_time
 from dotenv import load_dotenv
