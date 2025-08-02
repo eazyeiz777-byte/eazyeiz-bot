@@ -9,7 +9,6 @@ import os, sys, csv, time, threading, requests, numpy as np, pandas as pd
 from datetime import datetime, timedelta, time as dt_time
 from dotenv import load_dotenv
 from flask import Flask, jsonify
-from strategy import evaluate_symbol
 
 load_dotenv()
 
@@ -280,30 +279,13 @@ def scan():
                     if df.empty or len(df) < 200:
                         continue
 
-                    # --- Signal evaluation logic ---
-                    try:
-                        signal, reason = evaluate_symbol(df)
-                        if signal:
-                            message = f"📈 *Signal Found!* {pair} | {tf} TF\n🧠 Reason: {reason}"
-                            send_telegram_message(message)
-                    except Exception as e:
-                        print(f"[ERROR] Signal eval failed for {pair} ({tf}): {e}")
-
-                    # --- Optional: custom metrics like ATR/close etc ---
                     idx = len(df) - 1
                     atr_series = atr(df)
                     atr_val = atr_series.iloc[-1] if len(atr_series) > 0 else 0
                     close = df["close"].iloc[-1]
 
-        except Exception as e:
-            print(f"[SCAN ERROR] {e}")
-
                     # Global guards
-                    def evaluate_symbol(df):
-    if skip_event_window():
-        return False, "Skipping due to major event window"
-    
-    # ... your signal logic below ...
+                    if skip_event_window():
                         continue
                     news_flag = check_news(pair.split("USDT")[0])
                     session_ok = in_session() and not risky_time()
