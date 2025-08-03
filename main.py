@@ -1,5 +1,5 @@
 # ============================================================
-# SMC Scalper Bot – FIRST-LEVEL LATENCY EDITION
+# SMC Scalper Bot – FIRST-LEVEL LATENCY EDITION (fixed startup)
 # 1. Zero artificial delay (< 200 ms after Binance candle close).
 # 2. All prior features kept intact.
 # ============================================================
@@ -75,7 +75,6 @@ class OHLCV:
         self.store = {}
 
     def add_candle(self, pair, tf, k):
-        """Store candle and if closed==True → trigger scan immediately."""
         if pair not in self.store:
             self.store[pair] = {}
         if tf not in self.store[pair]:
@@ -109,7 +108,7 @@ class OHLCV:
                     async for msg in ws:
                         data = json.loads(msg)
                         k = data.get("k")
-                        if k and k.get("x"):               # candle closed
+                        if k and k.get("x"):
                             df = self.add_candle(pair, tf, k)
                             asyncio.create_task(process_signal(pair, tf, df))
             except Exception as e:
@@ -263,7 +262,7 @@ def send(msg):
     except Exception as e:
         logging.error("Telegram error: %s", e)
 
-# ---------- SIGNAL PROCESSOR (runs instantly on candle close) ----------
+# ---------- SIGNAL PROCESSOR ----------
 async def process_signal(pair, tf, df):
     if len(df) < 200:
         return
@@ -329,14 +328,16 @@ def keep_alive():
             requests.get("http://localhost:5000/health", timeout=5)
         except Exception:
             pass
-        time.sleep(300)     # 5 min
+        time.sleep(300)
 
 # ---------- BOOT ----------
 def main():
     logging.info("SMC Bot – First-Level-Latency Edition starting…")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    Thread(target=lambda: loop.run_until_complete(asyncio.gather(top_pairs.run(), ohlcv.run())), daemon=True).start()
+
+    def _async_thread():
+        asyncio.run(asyncio.gather(top_pairs.run(), ohlcv.run()))
+
+    Thread(target=_async_thread, daemon=True).start()
     Thread(target=keep_alive, daemon=True).start()
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
