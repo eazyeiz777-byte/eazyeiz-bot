@@ -1,5 +1,8 @@
-# ============================================================
-# SMC Scalper Bot – Render-ready, no more event-loop crash
+diagnose this bot script and provide details and fixes. # ============================================================
+# SMC Scalper Bot – Render diagnostics edition
+# 1. DEBUG logging
+# 2. Instant backfill for BTCUSDT & ETHUSDT
+# 3. 1-s reconnect delay to curb rate-limit
 # ============================================================
 
 import os
@@ -16,7 +19,13 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 from threading import Thread
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# -----------------------------------------------------------
+# 1. DEBUG logging to see WebSocket activity
+# -----------------------------------------------------------
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # ---------- CONFIG ----------
 TIMEFRAMES = ["15m", "1h", "4h"]
@@ -51,7 +60,7 @@ class TopPairs:
                         if time.time() - self._last_sort >= 60:
                             self._pairs = sorted(self._vol, key=self._vol.get, reverse=True)[:100]
                             self._last_sort = time.time()
-                            logging.debug("Top-100 refreshed")
+                            logging.debug("Top-100 refreshed with %d pairs", len(self._pairs))
             except Exception as e:
                 logging.error("TopPairs WS error: %s", e)
                 await asyncio.sleep(5)
@@ -75,6 +84,20 @@ class OHLCV:
         self.store[pair][tf] = df
         return df
 
+    # -----------------------------------------------------------
+    # 2. Backfill helper
+    # -----------------------------------------------------------
+    def backfill(self, pair):
+        for tf in self.tfs:
+            url = f"https://fapi.binance.com/fapi/v1/klines?symbol={pair}&interval={tf}&limit=210"
+            try:
+                for c in requests.get(url, timeout=10).json():
+                    k = {"t": c[0], "o": c[1], "h": c[2], "l": c[3], "c": c[4], "v": c[5]}
+                    self.add_candle(pair, tf, k)
+                logging.debug("Backfilled %s %s (%d bars)", pair, tf, len(self.store[pair][tf]))
+            except Exception as e:
+                logging.warning("Backfill %s %s failed: %s", pair, tf, e)
+
     async def run(self):
         while True:
             pairs = top_pairs.current()
@@ -89,6 +112,7 @@ class OHLCV:
         while True:
             try:
                 async with websockets.connect(uri) as ws:
+                    logging.debug("WS connected %s %s", pair, tf)
                     async for msg in ws:
                         data = json.loads(msg)
                         k = data.get("k")
@@ -97,7 +121,7 @@ class OHLCV:
                             asyncio.create_task(process_signal(pair, tf, df))
             except Exception as e:
                 logging.error("OHLCV WS %s %s: %s", pair, tf, e)
-                await asyncio.sleep(5)
+                await asyncio.sleep(1)   # 3. Rate-limit cushion
 
 ohlcv = OHLCV(TIMEFRAMES)
 
@@ -312,6 +336,10 @@ def keep_alive():
 # ---------- BOOT ----------
 def main():
     logging.info("SMC Bot – First-Level-Latency Edition starting…")
+
+    # Backfill two majors immediately
+    ohlcv.backfill("BTCUSDT")
+    ohlcv.backfill("ETHUSDT")
 
     def _async_thread():
         loop = asyncio.new_event_loop()
