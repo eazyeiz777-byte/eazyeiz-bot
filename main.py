@@ -470,4 +470,45 @@ def stats():
 
 # Keep-alive function for free hosting platforms
 def keep_alive():
-    """Prevents free tier services fr
+    """Prevents free tier services from sleeping by self-pinging"""
+    while True:
+        try:
+            time.sleep(600)  # Wait 10 minutes
+            requests.get("http://localhost:5000/health", timeout=5)
+        except Exception as e:
+            logging.error(f"[KEEP-ALIVE ERROR] {e}")
+
+# ---------- 16. Application startup ----------
+if __name__ == "__main__":
+    print("="*60)
+    print("SMC TRADING BOT - STARTING")
+    print("="*60)
+
+    # Validate essential credentials
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("[ERROR] Missing Telegram credentials!")
+        sys.exit(1)
+
+    print(f"[INFO] Bot configuration:")
+    print(f"  - Account Equity: ${ACCOUNT_EQUITY:,.2f}")
+    print(f"  - Risk Per Trade: {RISK_PER_TRADE*100:.1f}%")
+    print(f"  - Signal Threshold: {SIGNAL_CONF_THRESHOLD*100:.0f}%")
+    print(f"  - Timeframes: {', '.join(TIMEFRAMES)}")
+    print("="*60)
+
+    # Start background threads
+    print("[INIT] Starting trading scanner...")
+    threading.Thread(target=scan, daemon=True).start()
+
+    print("[INIT] Starting keep-alive service...")
+    threading.Thread(target=keep_alive, daemon=True).start()
+
+    # Send startup notification
+    send(f"🤖 *SMC Bot Started*\n\n"
+         f"✅ Scanning {', '.join(TIMEFRAMES)} timeframes\n"
+         f"✅ Signal threshold: {SIGNAL_CONF_THRESHOLD*100:.0f}%\n"
+         f"🚀 Ready to find trading opportunities!")
+
+    # Start Flask web server
+    print("[INIT] Starting web server...")
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
