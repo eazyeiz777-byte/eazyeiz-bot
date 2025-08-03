@@ -13,7 +13,10 @@ import threading
 import requests
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta, time as dt_time, timezone
+import websockets
+import asyncio
+import json
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from flask import Flask, jsonify
 import logging
@@ -31,7 +34,6 @@ logging.basicConfig(
 )
 
 # ---------- 1. Environment Secrets ----------
-KUCOIN_BASE_URL = "https://api.kucoin.com"
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -46,60 +48,76 @@ SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 0.5))
 LOG_PATH = "signal_log.csv"
 
 # ---------- 3. Fetch tradable pairs (FIXED ENDPOINTS) ----------
-def top_kucoin_usdtm_pairs():
+def top_binance_usdtp_pairs():
     try:
         response = requests.get(
-            "https://api.kucoin.com/api/v1/market/allTickers", timeout=10
+            "https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10
         )
         data = response.json()
-        if data.get("code") == "200000":
-            tickers = data["data"]["ticker"]
-            sorted_tickers = sorted(tickers, key=lambda x: float(x["volValue"]), reverse=True)
-            top_100_tickers = [ticker["symbol"] for ticker in sorted_tickers[:100] if "USDT" in ticker["symbol"]]
-            return top_100_tickers
-        return []
+        sorted_pairs = sorted(data, key=lambda x: float(x["volume"]), reverse=True)[:100]
+        return [pair["symbol"] for pair in sorted_pairs]
     except Exception as e:
-        logging.error(f"[ERROR] KuCoin API: {e}")
+        logging.error(f"[ERROR] Binance API: {e}")
         return []
 
-def prioritized_pairs():
-    kuc = top_kucoin_usdtm_pairs()
-    if not kuc:
-        logging.warning("[WARNING] No KuCoin pairs loaded")
-        return []
-    return kuc
-
-PAIRS = prioritized_pairs()
+PAIRS = top_binance_usdtp_pairs()
 
 # Reset pairs every 24 hours
 def reset_pairs():
     global PAIRS
     while True:
         time.sleep(24 * 60 * 60)  # Reset every 24 hours
-        PAIRS = prioritized_pairs()
-        logging.info("[INFO] Pairs list reset")
+        PAIRS = top_binance_usdtp_pairs()
+        logging.info(f"[INFO] Pairs list reset to {len(PAIRS)} pairs")
 
 # Start the reset pairs thread
 threading.Thread(target=reset_pairs, daemon=True).start()
 
-# ---------- 4. OHLCV fetch (FIXED ENDPOINT) ----------
-def fetch_ohlcv(pair, tf="15m", limit=300):
-    gran = {"15m": 900, "1h": 3600, "4h": 14400}[tf]
-    try:
-        r = requests.get(
-            f"{KUCOIN_BASE_URL}/api/v1/market/candles",
-            params={"symbol": pair, "type": f"{gran//60}min", "limit": limit},
-            timeout=10
-        ).json()
-        if r.get("code") == "200000" and r.get("data"):
-            df = pd.DataFrame(r["data"])
-            if len(df) > 0:
-                df.columns = ["time", "open", "close", "high", "low", "volume", "turnover"]
-                return df.astype(float).sort_values("time").reset_index(drop=True)
-        return pd.DataFrame()
-    except Exception as e:
-        logging.error(f"[ERROR] OHLCV fetch for {pair}: {e}")
-        return pd.DataFrame()
+# ---------- 4. Binance WebSocket Integration ----------
+class BinanceWebSocket:
+    def __init__(self, pairs, timeframes):
+        self.pairs = pairs
+        self.timeframes = timeframes
+        self.data = {pair: {tf: pd.DataFrame() for tf in timeframes} for pair in pairs}
+
+    async def _handle_websocket(self, pair, tf):
+        uri = f"wss://fstream.binance.com/ws/{pair.lower()}@kline_{self._convert_timeframe(tf)}"
+        async with websockets.connect(uri) as websocket:
+            while True:
+                try:
+                    data = await websocket.recv()
+                    data = json.loads(data)
+                    candle = data['k']
+                    if candle['x']:  # Check if candle is closed
+                        df = pd.DataFrame([{
+                            'time': candle['t'],
+                            'open': float(candle['o']),
+                            'high': float(candle['h']),
+                            'low': float(candle['l']),
+                            'close': float(candle['c']),
+                            'volume': float(candle['v'])
+                        }])
+                        self.data[pair][tf] = pd.concat([self.data[pair][tf], df]).drop_duplicates('time').sort_values('time').reset_index(drop=True)
+                except Exception as e:
+                    logging.error(f"WebSocket error for {pair} {tf}: {e}")
+                    await asyncio.sleep(5)
+
+    def _convert_timeframe(self, tf):
+        return {
+            "15m": "15m",
+            "1h": "1h",
+            "4h": "4h"
+        }.get(tf, "15m")
+
+    def start(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        tasks = [self._handle_websocket(pair, tf) for pair in self.pairs for tf in self.timeframes]
+        loop.run_until_complete(asyncio.gather(*tasks))
+
+# Initialize WebSocket connection
+ws = BinanceWebSocket(PAIRS, TIMEFRAMES)
+threading.Thread(target=ws.start, daemon=True).start()
 
 # ---------- 5. Economic-calendar filter (IMPROVED ERROR HANDLING) ----------
 EVENT_CACHE = {"last": None, "events": []}
@@ -293,7 +311,7 @@ def scan():
         try:
             for pair in PAIRS:
                 for tf in TIMEFRAMES:
-                    df = fetch_ohlcv(pair, tf)
+                    df = ws.data[pair][tf]
                     if df.empty or len(df) < 200:
                         logging.warning(f"[SCAN] Insufficient data for {pair} on {tf}")
                         continue
