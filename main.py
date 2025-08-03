@@ -1,7 +1,5 @@
 # ============================================================
-# SMC Scalper Bot – FIRST-LEVEL LATENCY EDITION (fixed startup)
-# 1. Zero artificial delay (< 200 ms after Binance candle close).
-# 2. All prior features kept intact.
+# SMC Scalper Bot – Render-ready, no more event-loop crash
 # ============================================================
 
 import os
@@ -18,11 +16,7 @@ from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 from threading import Thread
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---------- CONFIG ----------
 TIMEFRAMES = ["15m", "1h", "4h"]
@@ -35,12 +29,10 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ---------- TOP-100 PAIRS ----------
+# ---------- TOP-100 ----------
 class TopPairs:
     def __init__(self):
-        self._pairs = []
-        self._vol = {}
-        self._last_sort = 0
+        self._pairs, self._vol, self._last_sort = [], {}, 0
 
     def current(self):
         return self._pairs[:]
@@ -53,14 +45,12 @@ class TopPairs:
                     async for msg in ws:
                         tickers = json.loads(msg)
                         for t in tickers:
-                            sym = t.get("s")
-                            vol = t.get("quoteVolume")
+                            sym, vol = t.get("s"), t.get("quoteVolume")
                             if sym and sym.endswith("USDT") and vol is not None:
                                 self._vol[sym] = float(vol)
-                        now = time.time()
-                        if now - self._last_sort >= 60:
+                        if time.time() - self._last_sort >= 60:
                             self._pairs = sorted(self._vol, key=self._vol.get, reverse=True)[:100]
-                            self._last_sort = now
+                            self._last_sort = time.time()
                             logging.debug("Top-100 refreshed")
             except Exception as e:
                 logging.error("TopPairs WS error: %s", e)
@@ -68,7 +58,7 @@ class TopPairs:
 
 top_pairs = TopPairs()
 
-# ---------- OHLCV + FIRST-LEVEL LATENCY ----------
+# ---------- OHLCV ----------
 class OHLCV:
     def __init__(self, tfs):
         self.tfs = tfs
@@ -79,14 +69,8 @@ class OHLCV:
             self.store[pair] = {}
         if tf not in self.store[pair]:
             self.store[pair][tf] = pd.DataFrame(columns=["time","open","high","low","close","volume"])
-        row = {
-            "time": k["t"],
-            "open": float(k["o"]),
-            "high": float(k["h"]),
-            "low": float(k["l"]),
-            "close": float(k["c"]),
-            "volume": float(k["v"])
-        }
+        row = {"time": k["t"], "open": float(k["o"]), "high": float(k["h"]),
+               "low": float(k["l"]), "close": float(k["c"]), "volume": float(k["v"])}
         df = pd.concat([self.store[pair][tf], pd.DataFrame([row])]).drop_duplicates("time").sort_values("time").reset_index(drop=True)
         self.store[pair][tf] = df
         return df
@@ -121,17 +105,14 @@ ohlcv = OHLCV(TIMEFRAMES)
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def atr(df, n=14):
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"]  - df["close"].shift()).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([df["high"] - df["low"],
+                    (df["high"] - df["close"].shift()).abs(),
+                    (df["low"]  - df["close"].shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
 def adx(df, n=14):
     h,l,c = df["high"], df["low"], df["close"]
-    plus  = h.diff().clip(lower=0)
-    minus = (-l.diff()).clip(lower=0)
+    plus, minus = h.diff().clip(lower=0), (-l.diff()).clip(lower=0)
     tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
     atr_ = tr.rolling(n).mean()
     plus_di  = 100 * plus.rolling(n).mean()  / atr_
@@ -148,10 +129,8 @@ def trend_ok(df, direction):
 def liquidity_sweep(df, lb=5):
     highs = df["high"].rolling(lb).max().shift(1)
     lows  = df["low"].rolling(lb).min().shift(1)
-    return {
-        "high": (df["high"] > highs) & (df["close"] < highs),
-        "low":  (df["low"]  < lows)  & (df["close"] > lows)
-    }
+    return {"high": (df["high"] > highs) & (df["close"] < highs),
+            "low":  (df["low"]  < lows)  & (df["close"] > lows)}
 
 def momentum(df):
     body = (df["close"] - df["open"]).abs()
@@ -187,7 +166,7 @@ def tp_sl_signal(entry, direction, sweep_wick, atr_val, df):
         stop = sweep_wick + 1.1 * atr_val
     swing_len = abs(df["high"].rolling(20).max().iloc[-1] - df["low"].rolling(20).min().iloc[-1])
     swing_fracs = [0.35, 0.60, 0.85]
-    atr_caps = [0.75, 1.25, 1.75]
+    atr_caps    = [0.75, 1.25, 1.75]
     tps = []
     for sf, af in zip(swing_fracs, atr_caps):
         swing_tgt = entry + sf * swing_len * (1 if direction == "long" else -1)
@@ -335,7 +314,12 @@ def main():
     logging.info("SMC Bot – First-Level-Latency Edition starting…")
 
     def _async_thread():
-        asyncio.run(asyncio.gather(top_pairs.run(), ohlcv.run()))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(asyncio.gather(top_pairs.run(), ohlcv.run()))
+        finally:
+            loop.close()
 
     Thread(target=_async_thread, daemon=True).start()
     Thread(target=keep_alive, daemon=True).start()
@@ -344,3 +328,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                    
