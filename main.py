@@ -1,10 +1,9 @@
 # ============================================================
-# SMC Scalper Bot – FULL PRODUCTION, FREE-TIER SAFE
-# Optimised for Render / Railway / Fly.io
+# SMC Scalper Bot – FINAL
+# Fixed: safe quoteVolume, free-tier keep-alive
 # ============================================================
 
 import os
-import sys
 import csv
 import time
 import threading
@@ -18,14 +17,11 @@ import websockets
 from datetime import datetime, timedelta, timezone
 from flask import Flask, jsonify
 
-# ---------- 0. Logging ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler()]
-)
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[logging.StreamHandler()])
 
-# ---------- 1. Config ----------
+# ---------- CONFIG ----------
 TIMEFRAMES = ["15m", "1h", "4h"]
 ACCOUNT_EQUITY = float(os.getenv("ACCOUNT_EQUITY", 1000))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.01))
@@ -36,7 +32,7 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ---------- 2. Top-100 pairs – CPU-light ----------
+# ---------- TOP-100 PAIRS (SAFE quoteVolume) ----------
 class TopPairs:
     def __init__(self):
         self._pairs = []
@@ -57,21 +53,21 @@ class TopPairs:
                             continue
                         for t in tickers:
                             sym = t.get("s")
-                            if sym and sym.endswith("USDT"):
-                                self._vol[sym] = float(t.get("quoteVolume", 0))
-                        # sort every 60 s
+                            vol = t.get("quoteVolume")
+                            if sym and sym.endswith("USDT") and vol is not None:
+                                self._vol[sym] = float(vol)
                         now = time.time()
                         if now - self._last_sort >= 60:
                             self._pairs = sorted(self._vol, key=self._vol.get, reverse=True)[:100]
                             self._last_sort = now
-                            logging.info("Top-100 updated: %s", self._pairs)
+                            logging.info("Top-100 updated: %d pairs", len(self._pairs))
             except Exception as e:
                 logging.error("TopPairs WS error: %s", e)
                 await asyncio.sleep(5)
 
 top_pairs = TopPairs()
 
-# ---------- 3. OHLCV WebSocket ----------
+# ---------- OHLCV ----------
 class OHLCV:
     def __init__(self, tfs):
         self.tfs = tfs
@@ -117,7 +113,7 @@ class OHLCV:
 
 ohlcv = OHLCV(TIMEFRAMES)
 
-# ---------- 4. Technical helpers ----------
+# ---------- TECH HELPERS ----------
 def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
 
@@ -147,10 +143,8 @@ def trend_ok(df, direction):
 def liquidity_sweep(df, lb=5):
     highs = df["high"].rolling(lb).max().shift(1)
     lows = df["low"].rolling(lb).min().shift(1)
-    return {
-        "high": (df["high"] > highs) & (df["close"] < highs),
-        "low": (df["low"] < lows) & (df["close"] > lows)
-    }
+    return {"high": (df["high"] > highs) & (df["close"] < highs),
+            "low": (df["low"] < lows) & (df["close"] > lows)}
 
 def momentum(df):
     body = (df["close"] - df["open"]).abs()
@@ -171,7 +165,6 @@ def smc_score(df, idx):
     bos_down = df["low"] < prev_l
     ch_up = df["close"] > prev_h
     ch_down = df["close"] < prev_l
-
     if fvg_b.iloc[idx]: score += 1
     if ob_b.iloc[idx]: score += 1
     if bos_up.iloc[idx] or ch_up.iloc[idx]: score += 1
@@ -195,7 +188,7 @@ def tp_sl_signal(entry, direction, sweep_wick, atr_val, df):
         tps.append(min(swing_tgt, atr_tgt) if direction == "long" else max(swing_tgt, atr_tgt))
     return stop, tps[0], tps[1], tps[2]
 
-# ---------- 5. Filters ----------
+# ---------- 6. FILTERS ----------
 EVENT_CACHE = {"last": None, "events": []}
 def high_impact_events():
     now = datetime.now(timezone.utc)
@@ -226,7 +219,8 @@ def check_news(symbol):
             return False
         r = requests.get(f"https://finnhub.io/api/v1/news?category=crypto&token={FINNHUB_API_KEY}", timeout=10)
         news = r.json()
-        return any(symbol.upper() in (n.get("headline", "") + n.get("summary", "")).upper() for n in news)
+        symbol = symbol.upper()
+        return any(symbol in (n.get("headline", "") + n.get("summary", "")).upper() for n in news)
     except:
         return False
 
@@ -236,12 +230,12 @@ def in_session():
     return any(datetime.strptime(f"{s}:{m}", "%H:%M").time() <= now <= datetime.strptime(f"{e}:{n}", "%H:%M").time()
                for s, m, e, n in sessions)
 
-# ---------- 6. Logging & Telegram ----------
+# ---------- 7. LOGGING & TELEGRAM ----------
 def log_signal(row):
     header = ["timestamp", "pair", "tf", "direction", "entry", "stop", "tp1", "tp2", "tp3",
               "confidence", "size", "ema_ok", "event_ok", "news_ok"]
     try:
-        with open("signal_log.csv", "a", newline="") as f:
+        with open(LOG_PATH, "a", newline="") as f:
             writer = csv.writer(f)
             if f.tell() == 0:
                 writer.writerow(header)
@@ -261,7 +255,7 @@ def send(msg):
     except Exception as e:
         logging.error("Telegram error: %s", e)
 
-# ---------- 7. Scan loop ----------
+# ---------- 8. SCAN LOOP ----------
 def scan():
     while True:
         try:
@@ -298,7 +292,7 @@ def scan():
                         stop, tp1, tp2, tp3 = tp_sl_signal(close, "long", df["low"].iloc[idx], atr_val, df)
                         size = int(np.floor((ACCOUNT_EQUITY * RISK_PER_TRADE) / abs(close - stop)))
                         log_signal([datetime.now(timezone.utc).isoformat(), pair, tf, "long", close, stop, tp1, tp2, tp3, conf, size, True, True, True])
-                        send(f"🟢 LONG {pair} {tf}\nEntry: {close}\nStop: {stop}\nTP1/2/3: {tp1}/{tp2}/{tp3}\nConf: {conf:.0%}")
+                        send(f"🟢 LONG {pair} {tf}\nEntry: {close:.6f}\nStop: {stop:.6f}\nTP1/2/3: {tp1:.6f}/{tp2:.6f}/{tp3:.6f}\nConf: {conf:.0%}")
 
                     if sweep["high"].iloc[idx] and mom.iloc[idx]:
                         if not trend_ok(df, "short"):
@@ -312,12 +306,12 @@ def scan():
                         stop, tp1, tp2, tp3 = tp_sl_signal(close, "short", df["high"].iloc[idx], atr_val, df)
                         size = int(np.floor((ACCOUNT_EQUITY * RISK_PER_TRADE) / abs(close - stop)))
                         log_signal([datetime.now(timezone.utc).isoformat(), pair, tf, "short", close, stop, tp1, tp2, tp3, conf, size, True, True, True])
-                        send(f"🔴 SHORT {pair} {tf}\nEntry: {close}\nStop: {stop}\nTP1/2/3: {tp1}/{tp2}/{tp3}\nConf: {conf:.0%}")
+                        send(f"🔴 SHORT {pair} {tf}\nEntry: {close:.6f}\nStop: {stop:.6f}\nTP1/2/3: {tp1:.6f}/{tp2:.6f}/{tp3:.6f}\nConf: {conf:.0%}")
         except Exception as e:
             logging.error("Scan error: %s", e)
         time.sleep(60)
 
-# ---------- 8. Flask ----------
+# ---------- 9. FLASK ----------
 app = Flask(__name__)
 
 @app.route("/")
@@ -328,15 +322,27 @@ def ok():
 def health():
     return jsonify(status="healthy")
 
-# ---------- 9. Bootstrap ----------
+# ---------- 10. KEEP-ALIVE ----------
+def keep_alive():
+    """Self-ping every 5 min to prevent Render free-tier sleep"""
+    while True:
+        try:
+            requests.get("http://localhost:5000/health", timeout=5)
+        except Exception:
+            pass
+        time.sleep(300)
+
+# ---------- 11. BOOT STRAP ----------
 def main():
-    logging.info("Starting SMC Bot...")
+    logging.info("SMC Bot starting…")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     threading.Thread(target=lambda: loop.run_until_complete(asyncio.gather(top_pairs.run(), ohlcv.run())), daemon=True).start()
     threading.Thread(target=scan, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
 
 if __name__ == "__main__":
     main()
+        
