@@ -47,7 +47,7 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.01))
 SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 0.5))
 LOG_PATH = "signal_log.csv"
 
-# ---------- 3. Fetch tradable pairs (FIXED ENDPOINTS) ----------
+# ---------- 3. Fetch tradable pairs ----------
 def top_binance_usdtp_pairs():
     try:
         response = requests.get(
@@ -82,25 +82,30 @@ class BinanceWebSocket:
 
     async def _handle_websocket(self, pair, tf):
         uri = f"wss://fstream.binance.com/ws/{pair.lower()}@kline_{self._convert_timeframe(tf)}"
-        async with websockets.connect(uri) as websocket:
-            while True:
-                try:
-                    data = await websocket.recv()
-                    data = json.loads(data)
-                    candle = data['k']
-                    if candle['x']:  # Check if candle is closed
-                        df = pd.DataFrame([{
-                            'time': candle['t'],
-                            'open': float(candle['o']),
-                            'high': float(candle['h']),
-                            'low': float(candle['l']),
-                            'close': float(candle['c']),
-                            'volume': float(candle['v'])
-                        }])
-                        self.data[pair][tf] = pd.concat([self.data[pair][tf], df]).drop_duplicates('time').sort_values('time').reset_index(drop=True)
-                except Exception as e:
-                    logging.error(f"WebSocket error for {pair} {tf}: {e}")
-                    await asyncio.sleep(5)
+        try:
+            async with websockets.connect(uri) as websocket:
+                logging.info(f"WebSocket connection established for {pair} on {tf}")
+                while True:
+                    try:
+                        data = await websocket.recv()
+                        data = json.loads(data)
+                        candle = data['k']
+                        if candle['x']:  # Check if candle is closed
+                            df = pd.DataFrame([{
+                                'time': candle['t'],
+                                'open': float(candle['o']),
+                                'high': float(candle['h']),
+                                'low': float(candle['l']),
+                                'close': float(candle['c']),
+                                'volume': float(candle['v'])
+                            }])
+                            self.data[pair][tf] = pd.concat([self.data[pair][tf], df]).drop_duplicates('time').sort_values('time').reset_index(drop=True)
+                    except Exception as e:
+                        logging.error(f"Error receiving data for {pair} {tf}: {e}")
+                        await asyncio.sleep(5)
+        except Exception as e:
+            logging.error(f"WebSocket connection error for {pair} {tf}: {e}")
+            await asyncio.sleep(5)
 
     def _convert_timeframe(self, tf):
         return {
@@ -119,7 +124,7 @@ class BinanceWebSocket:
 ws = BinanceWebSocket(PAIRS, TIMEFRAMES)
 threading.Thread(target=ws.start, daemon=True).start()
 
-# ---------- 5. Economic-calendar filter (IMPROVED ERROR HANDLING) ----------
+# ---------- 5. Economic-calendar filter ----------
 EVENT_CACHE = {"last": None, "events": []}
 
 def high_impact_events():
@@ -480,4 +485,4 @@ if __name__ == "__main__":
     # Start Flask web server
     print("[INIT] Starting web server...")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
-    
+        
