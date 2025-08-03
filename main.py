@@ -13,11 +13,22 @@ import threading
 import requests
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta, time as dt_time, timezone
 from dotenv import load_dotenv
 from flask import Flask, jsonify
+import logging
 
 load_dotenv()
+
+# Set up logging to a file
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('trading_bot.log'),
+        logging.StreamHandler()
+    ]
+)
 
 # ---------- 1. Environment Secrets ----------
 KUCOIN_BASE_URL = "https://api.kucoin.com"
@@ -31,7 +42,7 @@ print(f"[INIT] API Keys loaded: Finnhub={'✓' if FINNHUB_API_KEY else '✗'}, T
 TIMEFRAMES = ["15m", "1h", "4h"]
 ACCOUNT_EQUITY = float(os.getenv("ACCOUNT_EQUITY", 1000))
 RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.01))
-SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 0.6))
+SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 0.5))
 LOG_PATH = "signal_log.csv"
 
 # ---------- 3. Fetch tradable pairs (FIXED ENDPOINTS) ----------
@@ -48,13 +59,13 @@ def top_kucoin_usdtm_pairs():
             return top_100_tickers
         return []
     except Exception as e:
-        print(f"[ERROR] KuCoin API: {e}")
+        logging.error(f"[ERROR] KuCoin API: {e}")
         return []
 
 def prioritized_pairs():
     kuc = top_kucoin_usdtm_pairs()
     if not kuc:
-        print("[WARNING] No KuCoin pairs loaded")
+        logging.warning("[WARNING] No KuCoin pairs loaded")
         return []
     return kuc
 
@@ -66,7 +77,7 @@ def reset_pairs():
     while True:
         time.sleep(24 * 60 * 60)  # Reset every 24 hours
         PAIRS = prioritized_pairs()
-        print("[INFO] Pairs list reset")
+        logging.info("[INFO] Pairs list reset")
 
 # Start the reset pairs thread
 threading.Thread(target=reset_pairs, daemon=True).start()
@@ -87,19 +98,19 @@ def fetch_ohlcv(pair, tf="15m", limit=300):
                 return df.astype(float).sort_values("time").reset_index(drop=True)
         return pd.DataFrame()
     except Exception as e:
-        print(f"[ERROR] OHLCV fetch for {pair}: {e}")
+        logging.error(f"[ERROR] OHLCV fetch for {pair}: {e}")
         return pd.DataFrame()
 
 # ---------- 5. Economic-calendar filter (IMPROVED ERROR HANDLING) ----------
 EVENT_CACHE = {"last": None, "events": []}
 
 def high_impact_events():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if EVENT_CACHE["last"] and (now - EVENT_CACHE["last"]).seconds < 3600:
         return EVENT_CACHE["events"]
     try:
         if not FINNHUB_API_KEY:
-            print("[INFO] No Finnhub API key - economic calendar disabled")
+            logging.info("[INFO] No Finnhub API key - economic calendar disabled")
             return []
         r = requests.get(
             f"https://finnhub.io/api/v1/calendar/economic?token={FINNHUB_API_KEY}",
@@ -110,12 +121,12 @@ def high_impact_events():
                    for e in r.json().get("economicCalendar", [])
                    if e.get("impact") in ("High", "Fed", "CPI")]
             EVENT_CACHE.update({"last": now, "events": evs})
-            print(f"[INFO] Loaded {len(evs)} high-impact economic events")
+            logging.info(f"[INFO] Loaded {len(evs)} high-impact economic events")
         else:
-            print(f"[WARNING] Finnhub API error {r.status_code} - continuing without economic filter")
+            logging.warning(f"[WARNING] Finnhub API error {r.status_code} - continuing without economic filter")
             EVENT_CACHE.update({"last": now, "events": []})
     except Exception as e:
-        print(f"[WARNING] Economic calendar error: {e} - continuing without filter")
+        logging.warning(f"[WARNING] Economic calendar error: {e} - continuing without filter")
         EVENT_CACHE.update({"last": now, "events": []})
     return EVENT_CACHE["events"]
 
@@ -123,7 +134,7 @@ def skip_event_window(min_b=15, min_a=15):
     events = high_impact_events()
     if not events:
         return False  # No events loaded, continue trading
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     return any(ev - timedelta(minutes=min_b) <= now <= ev + timedelta(minutes=min_a)
                for ev in events)
 
@@ -234,17 +245,17 @@ def check_news(symbol):
         symbol = symbol.upper()
         return any(symbol in (n.get("headline", "") + n.get("summary", "")).upper() for n in news)
     except Exception as e:
-        print(f"[ERROR] News check for {symbol}: {e}")
+        logging.error(f"[ERROR] News check for {symbol}: {e}")
         return False
 
 # ---------- 11. Session filter ----------
 def in_session():
     sessions = [(7, 0, 15, 0), (13, 0, 21, 0)]
-    now = datetime.utcnow().time()
+    now = datetime.now(timezone.utc).time()
     return any(dt_time(s, m) <= now <= dt_time(e, n) for s, m, e, n in sessions)
 
 def risky_time():
-    now = datetime.utcnow().time()
+    now = datetime.now(timezone.utc).time()
     return dt_time(21, 0) <= now or now <= dt_time(7, 0)
 
 # ---------- 12. Logging ----------
@@ -258,7 +269,7 @@ def log_signal(row):
                 writer.writerow(header)
             writer.writerow(row)
     except Exception as e:
-        print(f"[LOG ERROR] {e}")
+        logging.error(f"[LOG ERROR] {e}")
 
 # ---------- 13. Telegram ----------
 def send(msg):
@@ -269,22 +280,25 @@ def send(msg):
             timeout=10
         )
         if response.status_code == 200:
-            print(f"[TELEGRAM] Signal sent: {msg[:50]}...")
+            logging.info(f"[TELEGRAM] Signal sent: {msg[:50]}...")
         else:
-            print(f"[TELEGRAM ERROR] Failed to send message: {response.status_code}")
+            logging.error(f"[TELEGRAM ERROR] Failed to send message: {response.status_code}")
     except Exception as e:
-        print(f"[TG ERROR] {e}")
+        logging.error(f"[TG ERROR] {e}")
 
 # ---------- 14. Main scan loop ----------
 def scan():
-    print("[SCAN] Starting market scanning...")
+    logging.info("[SCAN] Starting market scanning...")
     while True:
         try:
             for pair in PAIRS:
                 for tf in TIMEFRAMES:
                     df = fetch_ohlcv(pair, tf)
                     if df.empty or len(df) < 200:
+                        logging.warning(f"[SCAN] Insufficient data for {pair} on {tf}")
                         continue
+
+                    logging.info(f"[SCAN] Scanning pair: {pair} on timeframe: {tf}")
 
                     idx = len(df) - 1
                     atr_series = atr(df)
@@ -293,30 +307,44 @@ def scan():
 
                     # Global guards
                     if skip_event_window():
+                        logging.info(f"[SCAN] Skipping {pair} due to high-impact economic event window")
                         continue
+
                     news_flag = check_news(pair.split("USDT")[0])
+                    if news_flag:
+                        logging.info(f"[SCAN] Skipping {pair} due to relevant news")
+                        continue
+
                     session_ok = in_session() and not risky_time()
+                    if not session_ok:
+                        logging.info(f"[SCAN] Skipping {pair} due to session or risky time")
+                        continue
 
                     # SMC confluence
                     sweep = liquidity_sweep(df)
                     mom = momentum(df)
                     vol_ok = atr_val > 0.002 * close
-                    if not (session_ok and vol_ok):
+                    if not vol_ok:
+                        logging.info(f"[SCAN] Skipping {pair} due to insufficient volume")
                         continue
 
                     # LONG
                     if sweep["low"].iloc[idx] and mom.iloc[idx]:
+                        logging.info(f"[SCAN] Potential LONG signal detected for {pair} on {tf}")
                         if not trend_ok(df, "long"):
+                            logging.info(f"[SCAN] Rejected LONG signal for {pair} due to trend filter")
                             continue
                         score = smc_score(df, idx)
                         if score <= 0:
+                            logging.info(f"[SCAN] Rejected LONG signal for {pair} due to low SMC score")
                             continue
                         conf = min(0.99, 0.2 + 0.8 * (score / 3))
                         if conf < SIGNAL_CONF_THRESHOLD:
+                            logging.info(f"[SCAN] Rejected LONG signal for {pair} due to low confidence: {conf}")
                             continue
                         stop, tp1, tp2, tp3 = tp_sl_signal(close, "long", df["low"].iloc[idx], atr_val, df)
                         size = int(np.floor((ACCOUNT_EQUITY * RISK_PER_TRADE) / abs(close - stop)))
-                        log_signal([datetime.utcnow().isoformat(), pair, tf, "long", close, stop, tp1, tp2, tp3,
+                        log_signal([datetime.now(timezone.utc).isoformat(), pair, tf, "long", close, stop, tp1, tp2, tp3,
                                     conf, size, True, True, not news_flag])
                         send(f"🟢 *LONG* {pair} `{tf}`\n"
                              f"Entry: `{close:.6f}`\n"
@@ -324,20 +352,25 @@ def scan():
                              f"TP1/2/3: `{tp1:.6f}` / `{tp2:.6f}` / `{tp3:.6f}`\n"
                              f"Conf: `{conf*100:.0f}%`\n"
                              f"Size: `{size}`")
+                        logging.info(f"[SCAN] LONG signal sent for {pair} on {tf}")
 
                     # SHORT
                     if sweep["high"].iloc[idx] and mom.iloc[idx]:
+                        logging.info(f"[SCAN] Potential SHORT signal detected for {pair} on {tf}")
                         if not trend_ok(df, "short"):
+                            logging.info(f"[SCAN] Rejected SHORT signal for {pair} due to trend filter")
                             continue
                         score = smc_score(df, idx)
                         if score >= 0:
+                            logging.info(f"[SCAN] Rejected SHORT signal for {pair} due to high SMC score")
                             continue
                         conf = min(0.99, 0.2 + 0.8 * (-score / 3))
                         if conf < SIGNAL_CONF_THRESHOLD:
+                            logging.info(f"[SCAN] Rejected SHORT signal for {pair} due to low confidence: {conf}")
                             continue
                         stop, tp1, tp2, tp3 = tp_sl_signal(close, "short", df["high"].iloc[idx], atr_val, df)
                         size = int(np.floor((ACCOUNT_EQUITY * RISK_PER_TRADE) / abs(close - stop)))
-                        log_signal([datetime.utcnow().isoformat(), pair, tf, "short", close, stop, tp1, tp2, tp3,
+                        log_signal([datetime.now(timezone.utc).isoformat(), pair, tf, "short", close, stop, tp1, tp2, tp3,
                                     conf, size, True, True, not news_flag])
                         send(f"🔴 *SHORT* {pair} `{tf}`\n"
                              f"Entry: `{close:.6f}`\n"
@@ -345,8 +378,10 @@ def scan():
                              f"TP1/2/3: `{tp1:.6f}` / `{tp2:.6f}` / `{tp3:.6f}`\n"
                              f"Conf: `{conf*100:.0f}%`\n"
                              f"Size: `{size}`")
+                        logging.info(f"[SCAN] SHORT signal sent for {pair} on {tf}")
+
         except Exception as e:
-            print(f"[SCAN ERROR] {e}")
+            logging.error(f"[SCAN ERROR] {e}")
 
         time.sleep(60)  # Scan every minute
 
@@ -360,12 +395,12 @@ def index():
         "pairs_loaded": len(PAIRS),
         "timeframes": TIMEFRAMES,
         "confidence_threshold": SIGNAL_CONF_THRESHOLD,
-        "uptime": datetime.utcnow().isoformat()
+        "uptime": datetime.now(timezone.utc).isoformat()
     })
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()})
+    return jsonify({"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()})
 
 @app.route("/stats")
 def stats():
@@ -374,7 +409,7 @@ def stats():
             lines = len(f.readlines()) - 1  # Subtract header
         return jsonify({"signals_generated": max(0, lines)})
     except Exception as e:
-        print(f"[STATS ERROR] {e}")
+        logging.error(f"[STATS ERROR] {e}")
         return jsonify({"signals_generated": 0})
 
 # Keep-alive function for free hosting platforms
@@ -385,7 +420,7 @@ def keep_alive():
             time.sleep(600)  # Wait 10 minutes
             requests.get("http://localhost:5000/health", timeout=5)
         except Exception as e:
-            print(f"[KEEP-ALIVE ERROR] {e}")
+            logging.error(f"[KEEP-ALIVE ERROR] {e}")
 
 # ---------- 16. Application startup ----------
 if __name__ == "__main__":
@@ -395,11 +430,11 @@ if __name__ == "__main__":
 
     # Validate essential credentials
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[ERROR] Missing Telegram credentials!")
+        logging.error("[ERROR] Missing Telegram credentials!")
         sys.exit(1)
 
     if not PAIRS:
-        print("[ERROR] No trading pairs loaded!")
+        logging.error("[ERROR] No trading pairs loaded!")
         sys.exit(1)
 
     print(f"[INFO] Bot configuration:")
@@ -427,4 +462,4 @@ if __name__ == "__main__":
     # Start Flask web server
     print("[INIT] Starting web server...")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
-                    
+    
