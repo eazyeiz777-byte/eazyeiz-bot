@@ -16,7 +16,7 @@ import pandas as pd
 import websockets
 import asyncio
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, jsonify
 import logging
@@ -47,64 +47,76 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", 0.01))
 SIGNAL_CONF_THRESHOLD = float(os.getenv("SIGNAL_CONF_THRESHOLD", 0.5))
 LOG_PATH = "signal_log.csv"
 
-# ---------- 3. Fetch tradable pairs ----------
-def top_binance_usdtp_pairs():
-    try:
-        response = requests.get(
-            "https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=10
-        )
-        data = response.json()
-        sorted_pairs = sorted(data, key=lambda x: float(x["volume"]), reverse=True)[:100]
-        return [pair["symbol"] for pair in sorted_pairs]
-    except Exception as e:
-        logging.error(f"[ERROR] Binance API: {e}")
-        return []
+# ---------- 3. Fetch tradable pairs using WebSocket ----------
+class BinanceAggregatedWebSocket:
+    def __init__(self):
+        self.top_pairs = []
 
-PAIRS = top_binance_usdtp_pairs()
+    async def _handle_websocket(self):
+        uri = "wss://fstream.binance.com/ws/!ticker@arr"
+        async with websockets.connect(uri) as websocket:
+            logging.info("WebSocket connection established for aggregated ticker stream")
+            while True:
+                try:
+                    data = await websocket.recv()
+                    data = json.loads(data)
+                    usdt_pairs = [item for item in data if item['symbol'].endswith('USDT')]
+                    sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)[:100]
+                    self.top_pairs = [pair['symbol'] for pair in sorted_pairs]
+                    logging.info(f"Top pairs updated: {self.top_pairs}")
+                except Exception as e:
+                    logging.error(f"Error receiving data: {e}")
+                    await asyncio.sleep(5)
 
-# Reset pairs every 24 hours
-def reset_pairs():
-    global PAIRS
-    while True:
-        time.sleep(24 * 60 * 60)  # Reset every 24 hours
-        PAIRS = top_binance_usdtp_pairs()
-        logging.info(f"[INFO] Pairs list reset to {len(PAIRS)} pairs")
+    def start(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._handle_websocket())
 
-# Start the reset pairs thread
-threading.Thread(target=reset_pairs, daemon=True).start()
+# Initialize WebSocket connection for top pairs
+ws_top_pairs = BinanceAggregatedWebSocket()
+threading.Thread(target=ws_top_pairs.start, daemon=True).start()
 
-# ---------- 4. Binance WebSocket Integration ----------
+# Function to get the current top pairs
+def get_top_pairs():
+    return ws_top_pairs.top_pairs
+
+# ---------- 4. Binance WebSocket Integration for OHLCV ----------
 class BinanceWebSocket:
-    def __init__(self, pairs, timeframes):
-        self.pairs = pairs
+    def __init__(self, timeframes):
         self.timeframes = timeframes
-        self.data = {pair: {tf: pd.DataFrame() for tf in timeframes} for pair in pairs}
+        self.data = {pair: {tf: pd.DataFrame() for tf in timeframes} for pair in get_top_pairs()}
 
     async def _handle_websocket(self, pair, tf):
         uri = f"wss://fstream.binance.com/ws/{pair.lower()}@kline_{self._convert_timeframe(tf)}"
-        try:
-            async with websockets.connect(uri) as websocket:
-                logging.info(f"WebSocket connection established for {pair} on {tf}")
-                while True:
-                    try:
-                        data = await websocket.recv()
-                        data = json.loads(data)
-                        candle = data['k']
-                        if candle['x']:  # Check if candle is closed
-                            df = pd.DataFrame([{
-                                'time': candle['t'],
-                                'open': float(candle['o']),
-                                'high': float(candle['h']),
-                                'low': float(candle['l']),
-                                'close': float(candle['c']),
-                                'volume': float(candle['v'])
-                            }])
-                            self.data[pair][tf] = pd.concat([self.data[pair][tf], df]).drop_duplicates('time').sort_values('time').reset_index(drop=True)
-                    except Exception as e:
-                        logging.error(f"Error receiving data for {pair} {tf}: {e}")
-                        await asyncio.sleep(5)
-        except Exception as e:
-            logging.error(f"WebSocket connection error for {pair} {tf}: {e}")
+        while True:
+            try:
+                async with websockets.connect(uri) as websocket:
+                    logging.info(f"WebSocket connection established for {pair} on {tf}")
+                    while True:
+                        try:
+                            data = await websocket.recv()
+                            data = json.loads(data)
+                            candle = data['k']
+                            if candle['x']:  # Check if candle is closed
+                                df = pd.DataFrame([{
+                                    'time': candle['t'],
+                                    'open': float(candle['o']),
+                                    'high': float(candle['h']),
+                                    'low': float(candle['l']),
+                                    'close': float(candle['c']),
+                                    'volume': float(candle['v'])
+                                }])
+                                self.data[pair][tf] = pd.concat([self.data[pair][tf], df]).drop_duplicates('time').sort_values('time').reset_index(drop=True)
+                        except json.JSONDecodeError as e:
+                            logging.error(f"JSON decode error for {pair} {tf}: {e}")
+                        except Exception as e:
+                            logging.error(f"Error receiving data for {pair} {tf}: {e}")
+                            break
+            except websockets.exceptions.ConnectionClosedError as e:
+                logging.error(f"WebSocket connection closed for {pair} {tf}: {e}")
+            except Exception as e:
+                logging.error(f"WebSocket connection error for {pair} {tf}: {e}")
             await asyncio.sleep(5)
 
     def _convert_timeframe(self, tf):
@@ -117,12 +129,13 @@ class BinanceWebSocket:
     def start(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        tasks = [self._handle_websocket(pair, tf) for pair in self.pairs for tf in self.timeframes]
+        pairs = get_top_pairs()
+        tasks = [self._handle_websocket(pair, tf) for pair in pairs for tf in self.timeframes]
         loop.run_until_complete(asyncio.gather(*tasks))
 
-# Initialize WebSocket connection
-ws = BinanceWebSocket(PAIRS, TIMEFRAMES)
-threading.Thread(target=ws.start, daemon=True).start()
+# Initialize WebSocket connection for OHLCV data
+ws_ohlcv = BinanceWebSocket(TIMEFRAMES)
+threading.Thread(target=ws_ohlcv.start, daemon=True).start()
 
 # ---------- 5. Economic-calendar filter ----------
 EVENT_CACHE = {"last": None, "events": []}
@@ -156,10 +169,9 @@ def high_impact_events():
 def skip_event_window(min_b=15, min_a=15):
     events = high_impact_events()
     if not events:
-        return False  # No events loaded, continue trading
+        return False
     now = datetime.now(timezone.utc)
-    return any(ev - timedelta(minutes=min_b) <= now <= ev + timedelta(minutes=min_a)
-               for ev in events)
+    return any(ev - timedelta(minutes=min_b) <= now <= ev + timedelta(minutes=min_a) for ev in events)
 
 # ---------- 6. Trend filter (200-EMA + ADX) ----------
 def ema(s, n):
@@ -241,8 +253,7 @@ def tp_sl_signal(entry, direction, sweep_wick, atr_val, df):
     else:
         stop = sweep_wick + 1.1 * atr_val
 
-    swing_len = abs(df["high"].rolling(20).max().iloc[-1] -
-                    df["low"].rolling(20).min().iloc[-1])
+    swing_len = abs(df["high"].rolling(20).max().iloc[-1] - df["low"].rolling(20).min().iloc[-1])
 
     swing_fracs = [0.35, 0.60, 0.85]
     atr_caps = [0.75, 1.25, 1.75]
@@ -314,9 +325,10 @@ def scan():
     logging.info("[SCAN] Starting market scanning...")
     while True:
         try:
-            for pair in PAIRS:
+            pairs = get_top_pairs()
+            for pair in pairs:
                 for tf in TIMEFRAMES:
-                    df = ws.data[pair][tf]
+                    df = ws_ohlcv.data.get(pair, {}).get(tf, pd.DataFrame())
                     if df.empty or len(df) < 200:
                         logging.warning(f"[SCAN] Insufficient data for {pair} on {tf}")
                         continue
@@ -328,7 +340,6 @@ def scan():
                     atr_val = atr_series.iloc[-1] if len(atr_series) > 0 else 0
                     close = df["close"].iloc[-1]
 
-                    # Global guards
                     if skip_event_window():
                         logging.info(f"[SCAN] Skipping {pair} due to high-impact economic event window")
                         continue
@@ -343,7 +354,6 @@ def scan():
                         logging.info(f"[SCAN] Skipping {pair} due to session or risky time")
                         continue
 
-                    # SMC confluence
                     sweep = liquidity_sweep(df)
                     mom = momentum(df)
                     vol_ok = atr_val > 0.002 * close
@@ -351,7 +361,6 @@ def scan():
                         logging.info(f"[SCAN] Skipping {pair} due to insufficient volume")
                         continue
 
-                    # LONG
                     if sweep["low"].iloc[idx] and mom.iloc[idx]:
                         logging.info(f"[SCAN] Potential LONG signal detected for {pair} on {tf}")
                         if not trend_ok(df, "long"):
@@ -377,7 +386,6 @@ def scan():
                              f"Size: `{size}`")
                         logging.info(f"[SCAN] LONG signal sent for {pair} on {tf}")
 
-                    # SHORT
                     if sweep["high"].iloc[idx] and mom.iloc[idx]:
                         logging.info(f"[SCAN] Potential SHORT signal detected for {pair} on {tf}")
                         if not trend_ok(df, "short"):
@@ -415,7 +423,7 @@ app = Flask(__name__)
 def index():
     return jsonify({
         "status": "SMC Trading Bot - Active",
-        "pairs_loaded": len(PAIRS),
+        "pairs_loaded": len(get_top_pairs()),
         "timeframes": TIMEFRAMES,
         "confidence_threshold": SIGNAL_CONF_THRESHOLD,
         "uptime": datetime.now(timezone.utc).isoformat()
@@ -456,15 +464,10 @@ if __name__ == "__main__":
         logging.error("[ERROR] Missing Telegram credentials!")
         sys.exit(1)
 
-    if not PAIRS:
-        logging.error("[ERROR] No trading pairs loaded!")
-        sys.exit(1)
-
     print(f"[INFO] Bot configuration:")
     print(f"  - Account Equity: ${ACCOUNT_EQUITY:,.2f}")
     print(f"  - Risk Per Trade: {RISK_PER_TRADE*100:.1f}%")
     print(f"  - Signal Threshold: {SIGNAL_CONF_THRESHOLD*100:.0f}%")
-    print(f"  - Pairs Loaded: {len(PAIRS)}")
     print(f"  - Timeframes: {', '.join(TIMEFRAMES)}")
     print("="*60)
 
@@ -477,7 +480,6 @@ if __name__ == "__main__":
 
     # Send startup notification
     send(f"🤖 *SMC Bot Started*\n\n"
-         f"✅ {len(PAIRS)} pairs loaded\n"
          f"✅ Scanning {', '.join(TIMEFRAMES)} timeframes\n"
          f"✅ Signal threshold: {SIGNAL_CONF_THRESHOLD*100:.0f}%\n"
          f"🚀 Ready to find trading opportunities!")
@@ -485,4 +487,3 @@ if __name__ == "__main__":
     # Start Flask web server
     print("[INIT] Starting web server...")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
-        
