@@ -16,7 +16,7 @@ import pandas as pd
 import websockets
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from flask import Flask, jsonify
 import logging
@@ -54,19 +54,38 @@ class BinanceAggregatedWebSocket:
 
     async def _handle_websocket(self):
         uri = "wss://fstream.binance.com/ws/!ticker@arr"
-        async with websockets.connect(uri) as websocket:
-            logging.info("WebSocket connection established for aggregated ticker stream")
-            while True:
-                try:
-                    data = await websocket.recv()
-                    data = json.loads(data)
-                    usdt_pairs = [item for item in data if item['symbol'].endswith('USDT')]
-                    sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)[:100]
-                    self.top_pairs = [pair['symbol'] for pair in sorted_pairs]
-                    logging.info(f"Top pairs updated: {self.top_pairs}")
-                except Exception as e:
-                    logging.error(f"Error receiving data: {e}")
-                    await asyncio.sleep(5)
+        while True:
+            try:
+                async with websockets.connect(uri) as websocket:
+                    logging.info("WebSocket connection established for aggregated ticker stream")
+                    while True:
+                        try:
+                            msg = await websocket.recv()
+                            try:
+                                tickers = json.loads(msg)
+                                if isinstance(tickers, list):
+                                    usdt_pairs = []
+                                    for t in tickers:
+                                        if isinstance(t, dict) and 's' in t:
+                                            if t['s'].endswith('USDT'):
+                                                usdt_pairs.append(t)
+                                        else:
+                                            logging.warning(f"Unexpected item format: {t}")
+                                    sorted_pairs = sorted(usdt_pairs, key=lambda x: float(x['quoteVolume']), reverse=True)[:100]
+                                    self.top_pairs = [pair['s'] for pair in sorted_pairs]
+                                    logging.info(f"Top pairs updated: {self.top_pairs}")
+                                else:
+                                    logging.warning(f"Unexpected data format: {tickers}")
+                            except json.JSONDecodeError as e:
+                                logging.error(f"JSON decode error: {e}")
+                            except Exception as e:
+                                logging.error(f"Error processing data: {e}")
+                        except Exception as e:
+                            logging.error(f"WebSocket error: {e}")
+                            break
+            except Exception as e:
+                logging.error(f"WebSocket connection error: {e}")
+            await asyncio.sleep(5)
 
     def start(self):
         loop = asyncio.new_event_loop()
@@ -85,7 +104,7 @@ def get_top_pairs():
 class BinanceWebSocket:
     def __init__(self, timeframes):
         self.timeframes = timeframes
-        self.data = {pair: {tf: pd.DataFrame() for tf in timeframes} for pair in get_top_pairs()}
+        self.data = {}
 
     async def _handle_websocket(self, pair, tf):
         uri = f"wss://fstream.binance.com/ws/{pair.lower()}@kline_{self._convert_timeframe(tf)}"
@@ -107,14 +126,14 @@ class BinanceWebSocket:
                                     'close': float(candle['c']),
                                     'volume': float(candle['v'])
                                 }])
+                                if pair not in self.data:
+                                    self.data[pair] = {}
+                                if tf not in self.data[pair]:
+                                    self.data[pair][tf] = pd.DataFrame()
                                 self.data[pair][tf] = pd.concat([self.data[pair][tf], df]).drop_duplicates('time').sort_values('time').reset_index(drop=True)
-                        except json.JSONDecodeError as e:
-                            logging.error(f"JSON decode error for {pair} {tf}: {e}")
                         except Exception as e:
                             logging.error(f"Error receiving data for {pair} {tf}: {e}")
                             break
-            except websockets.exceptions.ConnectionClosedError as e:
-                logging.error(f"WebSocket connection closed for {pair} {tf}: {e}")
             except Exception as e:
                 logging.error(f"WebSocket connection error for {pair} {tf}: {e}")
             await asyncio.sleep(5)
@@ -129,9 +148,12 @@ class BinanceWebSocket:
     def start(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        pairs = get_top_pairs()
-        tasks = [self._handle_websocket(pair, tf) for pair in pairs for tf in self.timeframes]
-        loop.run_until_complete(asyncio.gather(*tasks))
+        while True:
+            pairs = get_top_pairs()
+            if pairs:
+                tasks = [self._handle_websocket(pair, tf) for pair in pairs for tf in self.timeframes]
+                loop.run_until_complete(asyncio.gather(*tasks))
+            time.sleep(60)
 
 # Initialize WebSocket connection for OHLCV data
 ws_ohlcv = BinanceWebSocket(TIMEFRAMES)
@@ -292,6 +314,9 @@ def risky_time():
     now = datetime.now(timezone.utc).time()
     return dt_time(21, 0) <= now or now <= dt_time(7, 0)
 
+def dt_time(h, m):
+    return datetime.strptime(f"{h}:{m}", "%H:%M").time()
+
 # ---------- 12. Logging ----------
 def log_signal(row):
     header = ["timestamp", "pair", "tf", "direction", "entry", "stop", "tp1", "tp2", "tp3",
@@ -445,45 +470,4 @@ def stats():
 
 # Keep-alive function for free hosting platforms
 def keep_alive():
-    """Prevents free tier services from sleeping by self-pinging"""
-    while True:
-        try:
-            time.sleep(600)  # Wait 10 minutes
-            requests.get("http://localhost:5000/health", timeout=5)
-        except Exception as e:
-            logging.error(f"[KEEP-ALIVE ERROR] {e}")
-
-# ---------- 16. Application startup ----------
-if __name__ == "__main__":
-    print("="*60)
-    print("SMC TRADING BOT - STARTING")
-    print("="*60)
-
-    # Validate essential credentials
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("[ERROR] Missing Telegram credentials!")
-        sys.exit(1)
-
-    print(f"[INFO] Bot configuration:")
-    print(f"  - Account Equity: ${ACCOUNT_EQUITY:,.2f}")
-    print(f"  - Risk Per Trade: {RISK_PER_TRADE*100:.1f}%")
-    print(f"  - Signal Threshold: {SIGNAL_CONF_THRESHOLD*100:.0f}%")
-    print(f"  - Timeframes: {', '.join(TIMEFRAMES)}")
-    print("="*60)
-
-    # Start background threads
-    print("[INIT] Starting trading scanner...")
-    threading.Thread(target=scan, daemon=True).start()
-
-    print("[INIT] Starting keep-alive service...")
-    threading.Thread(target=keep_alive, daemon=True).start()
-
-    # Send startup notification
-    send(f"🤖 *SMC Bot Started*\n\n"
-         f"✅ Scanning {', '.join(TIMEFRAMES)} timeframes\n"
-         f"✅ Signal threshold: {SIGNAL_CONF_THRESHOLD*100:.0f}%\n"
-         f"🚀 Ready to find trading opportunities!")
-
-    # Start Flask web server
-    print("[INIT] Starting web server...")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+    """Prevents free tier services fr
