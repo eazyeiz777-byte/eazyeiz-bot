@@ -1,11 +1,22 @@
+# render.yaml
 services:
   - type: web
     name: smc-scalper-bot
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    plan: free # Or 'starter' for more resources
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py" # <-- Change 'your_script_name.py'
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.4
-      - key: PORT
-        value: 5000
+        value: 3.11 # Specify a recent Python version
+      - key: ACCOUNT_EQUITY
+        value: 1000
+      - key: RISK_PER_TRADE
+        value: 0.01
+      - key: SIGNAL_CONF_THRESHOLD
+        value: 0.5
+      - key: TELEGRAM_BOT_TOKEN
+        fromSecret: true # Mark as secret
+      - key: TELEGRAM_CHAT_ID
+        fromSecret: true # Mark as secret
