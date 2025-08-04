@@ -62,7 +62,7 @@ class TopPairs:
                             continue
                         for t in tickers:
                             sym = t.get("s")
-                            vol = t.get("quoteVolume")
+                            vol = t.get("q")
                             if sym and sym.endswith("USDT") and vol is not None:
                                 self._vol[sym] = float(vol)
 
