@@ -64,7 +64,7 @@ class TopPairs:
                         now = time.time()
                         if now - self._last_refresh >= 3600 or not self._pairs:
                             with pairs_lock:
-                                self._pairs = sorted(self._vol, key=self._vol.get, reverse=True)[:100]
+                                self._pairs = sorted(self._vol, key=self._vol.get, reverse=True)[:20]
                             self._last_refresh = now
                             logging.info(f"Top-100 pairs refreshed -> {len(self._pairs)} pairs")
             except Exception as e:
