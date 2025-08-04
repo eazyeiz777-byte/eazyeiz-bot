@@ -35,7 +35,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 pairs_lock = threading.Lock()
 ohlcv_lock = threading.Lock()
 
-# ---------- TOP-100 PAIRS ----------
+# ---------- TOP-100 PAIRS (MODIFIED TO TOP-20) ----------
 class TopPairs:
     def __init__(self):
         self._pairs = []
