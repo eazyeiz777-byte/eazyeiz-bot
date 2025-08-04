@@ -1,5 +1,5 @@
 # ============================================================
-# SMC Scalper – Fully Corrected & Deploy-Ready
+# SMC Scalper – Fully Corrected & SUPER-THROTTLED
 # ============================================================
 
 import os
@@ -54,18 +54,14 @@ class TopPairs:
                     logging.info("TopPairs WS connected.")
                     async for msg in ws:
                         tickers = json.loads(msg)
-                        if not isinstance(tickers, list):
-                            continue
+                        if not isinstance(tickers, list): continue
                         for t in tickers:
                             sym = t.get("s")
-                            # --- FIX #1: Corrected the key for quote volume ---
-                            # Binance uses 'q' for quote volume, not 'quoteVolume'.
                             vol = t.get("q")
                             if sym and sym.endswith("USDT") and vol is not None:
                                 self._vol[sym] = float(vol)
 
                         now = time.time()
-                        # Refresh immediately on first run, then every hour
                         if now - self._last_refresh >= 3600 or not self._pairs:
                             with pairs_lock:
                                 self._pairs = sorted(self._vol, key=self._vol.get, reverse=True)[:100]
@@ -77,14 +73,13 @@ class TopPairs:
 
 top_pairs = TopPairs()
 
-# ---------- OHLCV ----------
+# ---------- OHLCV (SUPER-THROTTLED VERSION) ----------
 class OHLCV:
     def __init__(self, tfs):
         self.tfs = tfs
         self.store = {}
-        # --- FIX #2: Added a semaphore to limit concurrent connection attempts ---
-        # This prevents the "timed out" error by not overwhelming the server.
-        self.semaphore = asyncio.Semaphore(25) # Allow 25 connections at a time
+        # --- FIX: Drastically reduce concurrency ---
+        self.semaphore = asyncio.Semaphore(5) # Allow only 5 connections at a time
 
     def get_df(self, pair, tf):
         with ohlcv_lock:
@@ -98,17 +93,14 @@ class OHLCV:
             "low": float(k["l"]), "close": float(k["c"]), "volume": float(k["v"])
         }
         with ohlcv_lock:
-            if pair not in self.store:
-                self.store[pair] = {}
+            if pair not in self.store: self.store[pair] = {}
             if tf not in self.store[pair]:
                 self.store[pair][tf] = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
-
             df = self.store[pair][tf]
             df.loc[len(df)] = new_row
             df.drop_duplicates(subset="time", keep="last", inplace=True)
             df.sort_values("time", inplace=True)
             df.reset_index(drop=True, inplace=True)
-            
             if len(df) > MAX_DF_LENGTH:
                 self.store[pair][tf] = df.iloc[-MAX_DF_LENGTH:].reset_index(drop=True)
             else:
@@ -121,24 +113,26 @@ class OHLCV:
             if not pairs:
                 await asyncio.sleep(5)
                 continue
-
-            tasks_to_start = []
+            
+            new_conn_ids = []
             for pair in pairs:
                 for tf in self.tfs:
                     conn_id = f"{pair}-{tf}"
                     if conn_id not in active_connections:
-                        task = asyncio.create_task(self._conn(pair, tf))
-                        tasks_to_start.append(task)
-                        active_connections.add(conn_id)
+                        new_conn_ids.append((pair, tf, conn_id))
 
-            if tasks_to_start:
-                logging.info(f"Starting {len(tasks_to_start)} new OHLCV streams (throttled)...")
+            if new_conn_ids:
+                logging.info(f"Starting {len(new_conn_ids)} new OHLCV streams (super-throttled)...")
+                for pair, tf, conn_id in new_conn_ids:
+                    asyncio.create_task(self._conn(pair, tf))
+                    active_connections.add(conn_id)
+                    # --- FIX: Add a small sleep between each connection attempt ---
+                    await asyncio.sleep(0.2) # Wait 200ms before starting the next one
 
             await asyncio.sleep(60)
 
     async def _conn(self, pair, tf):
         uri = f"wss://fstream.binance.com/ws/{pair.lower()}@kline_{tf}"
-        # --- FIX #2: Use the semaphore to throttle connection attempts ---
         async with self.semaphore:
             while True:
                 try:
@@ -146,56 +140,39 @@ class OHLCV:
                         async for msg in ws:
                             data = json.loads(msg)
                             k = data.get("k")
-                            if k and k.get("x"):
-                                self._add_candle(pair, tf, k)
+                            if k and k.get("x"): self._add_candle(pair, tf, k)
                 except Exception as e:
                     logging.warning(f"OHLCV WS {pair} {tf} -> {e}")
-                    await asyncio.sleep(15)
+                    # Increase wait time before retrying a failed connection
+                    await asyncio.sleep(30)
 
 ohlcv = OHLCV(TIMEFRAMES)
 
-# ---------- TECH ----------
-def ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
-
+# ---------- TECH (No changes) ----------
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def atr(df, n=14):
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"]  - df["close"].shift()).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat([(df["high"]-df["low"]), (df["high"]-df["close"].shift()).abs(), (df["low"]-df["close"].shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(n).mean()
-
 def adx(df, n=14):
     if len(df) < 2 * n: return 0
     h, l, c = df["high"], df["low"], df["close"]
-    plus_dm = h.diff()
-    minus_dm = l.diff()
+    plus_dm = h.diff(); minus_dm = l.diff()
     plus_di = 100 * (plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0).rolling(n).sum() / atr(df, n))
     minus_di = 100 * (minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0).rolling(n).sum() / atr(df, n))
     with np.errstate(divide='ignore', invalid='ignore'):
         dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di))
     return dx.rolling(n).mean().iloc[-1] if not dx.empty else 0
-
 def trend_ok(df, direction):
     if len(df) < 200: return False
-    e200 = ema(df["close"], 200).iloc[-1]
-    last = df["close"].iloc[-1]
-    adx_v = adx(df)
+    e200 = ema(df["close"], 200).iloc[-1]; last = df["close"].iloc[-1]; adx_v = adx(df)
     return (last > e200 and adx_v > 25) if direction == "long" else (last < e200 and adx_v > 25)
-
 def liquidity_sweep(df, lb=5):
-    highs = df["high"].rolling(lb, min_periods=lb).max().shift(1)
-    lows  = df["low"].rolling(lb, min_periods=lb).min().shift(1)
+    highs = df["high"].rolling(lb, min_periods=lb).max().shift(1); lows = df["low"].rolling(lb, min_periods=lb).min().shift(1)
     return {"high": (df["high"] > highs) & (df["close"] < highs), "low": (df["low"] < lows) & (df["close"] > lows)}
-
 def momentum(df):
-    body = (df["close"] - df["open"]).abs()
-    rng  = (df["high"] - df["low"]).replace(0, 1e-9)
-    body_ratio = body / rng
-    vol_mult = df["volume"] / df["volume"].rolling(20).mean()
+    body = (df["close"] - df["open"]).abs(); rng = (df["high"] - df["low"]).replace(0, 1e-9)
+    body_ratio = body / rng; vol_mult = df["volume"] / df["volume"].rolling(20).mean()
     return (body_ratio > 0.6) & (vol_mult > 1.5)
-
 def smc_score(df, idx):
     score = 0
     if len(df) < 10: return 0
@@ -203,18 +180,15 @@ def smc_score(df, idx):
     fvg_s = df["high"].iloc[idx-2] < df["low"].iloc[idx-1] if idx >= 2 else False
     ob_b  = df["close"].iloc[idx-1] < df["open"].iloc[idx-1] and df["close"].iloc[idx] > df["open"].iloc[idx] if idx >= 1 else False
     ob_s  = df["close"].iloc[idx-1] > df["open"].iloc[idx-1] and df["close"].iloc[idx] < df["open"].iloc[idx] if idx >= 1 else False
-    prev_h = df["high"].iloc[idx-5:idx].max()
-    prev_l = df["low"].iloc[idx-5:idx].min()
-    bos_up   = df["high"].iloc[idx] > prev_h
-    bos_down = df["low"].iloc[idx] < prev_l
-    if fvg_b: score += 1
-    if ob_b: score += 1
+    prev_h = df["high"].iloc[idx-5:idx].max(); prev_l = df["low"].iloc[idx-5:idx].min()
+    bos_up = df["high"].iloc[idx] > prev_h; bos_down = df["low"].iloc[idx] < prev_l
+    if fvg_b: score += 1;
+    if ob_b: score += 1;
     if bos_up: score += 1
-    if fvg_s: score -= 1
-    if ob_s: score -= 1
+    if fvg_s: score -= 1;
+    if ob_s: score -= 1;
     if bos_down: score -= 1
     return score
-
 def tp_sl_signal(entry, direction, sweep_wick, atr_val, df):
     stop = (sweep_wick - 1.1 * atr_val) if direction == "long" else (sweep_wick + 1.1 * atr_val)
     tps = []
@@ -224,123 +198,79 @@ def tp_sl_signal(entry, direction, sweep_wick, atr_val, df):
         tps.append(tp)
     return stop, tps[0], tps[1], tps[2]
 
-# ---------- TELEGRAM ----------
+# ---------- TELEGRAM (No changes) ----------
 def send_telegram(msg):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.warning("Telegram credentials not set. Skipping message.")
         return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
-            timeout=10
-        )
-    except Exception as e:
-        logging.error(f"Telegram send error -> {e}")
+    try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=10)
+    except Exception as e: logging.error(f"Telegram send error -> {e}")
 
-# ---------- SCANNER & SIGNALING ----------
+# ---------- SCANNER & SIGNALING (No changes) ----------
 def check_and_send_signal(pair, tf, df, direction):
-    idx = len(df) - 1
-    sweep = liquidity_sweep(df)
-    mom = momentum(df)
+    idx = len(df) - 1; sweep = liquidity_sweep(df); mom = momentum(df)
     is_sweep = sweep["low"].iloc[idx] if direction == "long" else sweep["high"].iloc[idx]
-    
     if is_sweep and mom.iloc[idx]:
         if not trend_ok(df, direction): return
-        
         score = smc_score(df, idx)
         is_score_valid = (score > 0) if direction == "long" else (score < 0)
         if not is_score_valid: return
-            
         conf = min(0.99, 0.2 + 0.8 * (abs(score) / 3))
         if conf < SIGNAL_CONF_THRESHOLD: return
-
-        close = df["close"].iloc[-1]
-        atr_val = atr(df).iloc[-1]
-        sweep_wick = df["low"].iloc[idx] if direction == "long" else df["high"].iloc[idx]
-        
+        close = df["close"].iloc[-1]; atr_val = atr(df).iloc[-1]; sweep_wick = df["low"].iloc[idx] if direction == "long" else df["high"].iloc[idx]
         stop, tp1, tp2, tp3 = tp_sl_signal(close, direction, sweep_wick, atr_val, df)
-        
         if abs(close - stop) < 1e-9: return
         size = int(np.floor((ACCOUNT_EQUITY * RISK_PER_TRADE) / abs(close - stop)))
         if size == 0: return
-
         icon = "🟢" if direction == "long" else "🔴"
-        msg = (
-            f"{icon} *{direction.upper()}* {pair} ({tf})\n\n"
-            f"**Entry:** `{close:.6f}`\n"
-            f"**Stop Loss:** `{stop:.6f}`\n"
-            f"**Take Profit 1:** `{tp1:.6f}`\n"
-            f"**Take Profit 2:** `{tp2:.6f}`\n"
-            f"**Take Profit 3:** `{tp3:.6f}`\n\n"
-            f"*Confidence:* `{conf:.0%}` | *Position Size:* `{size}`"
-        )
+        msg = (f"{icon} *{direction.upper()}* {pair} ({tf})\n\n"
+               f"**Entry:** `{close:.6f}`\n"
+               f"**Stop Loss:** `{stop:.6f}`\n"
+               f"**Take Profit 1:** `{tp1:.6f}`\n"
+               f"**Take Profit 2:** `{tp2:.6f}`\n"
+               f"**Take Profit 3:** `{tp3:.6f}`\n\n"
+               f"*Confidence:* `{conf:.0%}` | *Position Size:* `{size}`")
         send_telegram(msg)
         logging.info(f"Signal sent for {pair} ({tf}) - {direction.upper()}")
-        
-        # --- FIX #3: Corrected the cooldown logic to use the global 'ohlcv' object ---
-        # The previous code used 'self' which is not defined in this function.
         with ohlcv_lock:
-            if pair not in ohlcv.store: ohlcv.store[pair] = {} # Safety check
-            if 'last_signal_time' not in ohlcv.store[pair]:
-                ohlcv.store[pair]['last_signal_time'] = {}
+            if pair not in ohlcv.store: ohlcv.store[pair] = {}
+            if 'last_signal_time' not in ohlcv.store[pair]: ohlcv.store[pair]['last_signal_time'] = {}
             ohlcv.store[pair]['last_signal_time'][tf] = time.time()
-
 def scan_worker():
     logging.info("Scan loop started.")
-    time.sleep(15) # Wait for some data to be populated initially
+    time.sleep(20)
     while True:
         try:
             pairs = top_pairs.get_current()
             for pair in pairs:
                 for tf in TIMEFRAMES:
                     df = ohlcv.get_df(pair, tf)
-                    if len(df) < 200:
-                        continue
-                    
-                    # Cooldown check
+                    if len(df) < 200: continue
                     last_signal_time = ohlcv.store.get(pair, {}).get('last_signal_time', {}).get(tf, 0)
-                    if time.time() - last_signal_time < 3600: # 1 hour cooldown
-                        continue
-
-                    # UTC session filter
-                    if not (7 <= datetime.now(timezone.utc).hour < 21):
-                        continue
-                    
+                    if time.time() - last_signal_time < 3600: continue
+                    if not (7 <= datetime.now(timezone.utc).hour < 21): continue
                     check_and_send_signal(pair, tf, df, "long")
                     check_and_send_signal(pair, tf, df, "short")
-        except Exception as e:
-            logging.error(f"Scan tick error -> {e}", exc_info=True)
+        except Exception as e: logging.error(f"Scan tick error -> {e}", exc_info=True)
         time.sleep(60)
 
-# ---------- FLASK WEB SERVER ----------
+# ---------- FLASK & BOOTSTRAP (No changes) ----------
 app = Flask(__name__)
-
 @app.route("/")
-def root():
-    return "SMC Scalper is running."
-
+def root(): return "SMC Scalper is running."
 @app.route("/health")
 def health():
-    data = {
-        "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "top_pairs_count": len(top_pairs.get_current()),
-        "ohlcv_pairs_tracked": len(ohlcv.store)
-    }
-    return jsonify(data)
-
-# ---------- BOOTSTRAP ----------
+    return jsonify({
+        "status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat(),
+        "top_pairs_count": len(top_pairs.get_current()), "ohlcv_pairs_tracked": len(ohlcv.store)
+    })
 def main():
     logging.info("Bot bootstrapping...")
-
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     async_tasks = asyncio.gather(top_pairs.run(), ohlcv.run())
     threading.Thread(target=lambda: loop.run_until_complete(async_tasks), daemon=True).start()
-
     threading.Thread(target=scan_worker, daemon=True).start()
-
     port = int(os.environ.get("PORT", 8080))
     logging.info(f"Starting Flask server on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
