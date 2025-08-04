@@ -1,6 +1,6 @@
-# Core
-pandas==2.2.2
-numpy==1.26.4
-websockets==12.0
-flask==3.0.3
-requests==2.32.3
+# requirements.txt
+flask
+requests
+numpy
+pandas
+websockets
